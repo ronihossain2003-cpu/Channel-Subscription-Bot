@@ -1,214 +1,950 @@
 import os
-import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pymongo import MongoClient
-from datetime import datetime, timedelta
-from apscheduler.schedulers.background import BackgroundScheduler
+import logging
+from datetime import datetime, timedelta, timezone
+
 from flask import Flask
 from threading import Thread
 
-# --- RENDER KEEP-ALIVE SERVER ---
-app = Flask('')
-@app.route('/')
-def home(): return "Bot is running and healthy!"
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-def run_web():
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-def keep_alive():
-    Thread(target=run_web).start()
+from dotenv import load_dotenv
 
-# --- CONFIGURATION (Environment Variables) ---
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-MONGO_URI = os.getenv('MONGO_URI')
-ADMIN_ID = int(os.getenv('ADMIN_ID'))
-UPI_ID = os.getenv('UPI_ID')
-CONTACT_USERNAME = os.getenv('CONTACT_USERNAME')
 
-bot = telebot.TeleBot(BOT_TOKEN)
-client = MongoClient(MONGO_URI)
-db = client['sub_management']
-channels_col = db['channels']
-users_col = db['users']
+# ============================================================
+# CONFIG
+# ============================================================
 
-# --- ADMIN LOGIC ---
+load_dotenv()
 
-@bot.message_handler(commands=['start'])
-def start_handler(message):
-    user_id = message.from_user.id
-    text = message.text.split()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-    # User entry via Deep Link
-    if len(text) > 1:
-        try:
-            ch_id = int(text[1])
-            ch_data = channels_col.find_one({"channel_id": ch_id})
-            if ch_data:
-                markup = InlineKeyboardMarkup()
-                # Display Dynamic Plans
-                for p_time, p_price in ch_data['plans'].items():
-                    label = f"{p_time} Min" if int(p_time) < 60 else f"{int(p_time)//1440} Days"
-                    markup.add(InlineKeyboardButton(f"💳 {label} - ₹{p_price}", callback_data=f"select_{ch_id}_{p_time}"))
-                
-                markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
-                bot.send_message(message.chat.id, 
-                    f"Welcome!\n\nYou are joining: *{ch_data['name']}*.\n\nPlease select a subscription plan below:", 
-                    reply_markup=markup, parse_mode="Markdown")
-                return
-        except: pass
+# Payment numbers shown to users
+BKASH_NUMBER = os.getenv("BKASH_NUMBER", "01XXXXXXXXX")
+NAGAD_NUMBER = os.getenv("NAGAD_NUMBER", "01XXXXXXXXX")
 
-    # Admin Panel Greeting
-    if user_id == ADMIN_ID:
-        bot.send_message(message.chat.id, "✅ Admin Panel Active!\n\n/add - Add/Edit Channel & Prices\n/channels - Manage Existing Channels")
-    else:
-        bot.send_message(message.chat.id, "Welcome! To join a channel, please use the link provided by the Admin.")
+PORT = int(os.getenv("PORT", "10000"))
 
-@bot.message_handler(commands=['channels'], func=lambda m: m.from_user.id == ADMIN_ID)
-def list_channels(message):
-    markup = InlineKeyboardMarkup()
-    # Fetch all channels managed by this admin
-    cursor = channels_col.find({"admin_id": ADMIN_ID})
-    count = 0
-    for ch in cursor:
-        markup.add(InlineKeyboardButton(f"Channel: {ch['name']}", callback_data=f"manage_{ch['channel_id']}"))
-        count += 1
-    
-    markup.add(InlineKeyboardButton("➕ Add New Channel", callback_data="add_new"))
-    
-    if count == 0:
-        bot.send_message(ADMIN_ID, "No channels found. Click below to add one.", reply_markup=markup)
-    else:
-        bot.send_message(ADMIN_ID, "Your Managed Channels:", reply_markup=markup)
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN is missing in .env")
 
-@bot.message_handler(commands=['add'], func=lambda m: m.from_user.id == ADMIN_ID)
-def add_channel_start(message):
-    msg = bot.send_message(ADMIN_ID, "Please ensure the bot is an Admin in your channel, then FORWARD any message from that channel here.")
-    bot.register_next_step_handler(msg, get_plans)
+if ADMIN_ID == 0:
+    raise ValueError("ADMIN_ID is missing in .env")
 
-# Callback for Add New button
-@bot.callback_query_handler(func=lambda call: call.data == "add_new")
-def cb_add_new(call):
-    bot.answer_callback_query(call.id)
-    msg = bot.send_message(ADMIN_ID, "Please FORWARD any message from your channel here.")
-    bot.register_next_step_handler(msg, get_plans)
 
-def get_plans(message):
-    if message.forward_from_chat:
-        ch_id = message.forward_from_chat.id
-        ch_name = message.forward_from_chat.title
-        msg = bot.send_message(ADMIN_ID, 
-            f"Channel Detected: *{ch_name}*\n\nEnter plans in format (Minutes:Price):\n`Min:Price, Min:Price` \n\n"
-            "Example:\n`1440:99, 43200:199` (1 Day and 30 Days)", parse_mode="Markdown")
-        bot.register_next_step_handler(msg, finalize_channel, ch_id, ch_name)
-    else:
-        bot.send_message(ADMIN_ID, "❌ Error: Message was not forwarded. Use /add to try again.")
+# ============================================================
+# LOGGING
+# ============================================================
 
-def finalize_channel(message, ch_id, ch_name):
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# FIREBASE
+# ============================================================
+
+firebase_key = os.getenv("FIREBASE_KEY")
+
+if firebase_key:
+    import json
+
+    firebase_credentials = credentials.Certificate(
+        json.loads(firebase_key)
+    )
+else:
+    firebase_credentials = credentials.Certificate("firebase_key.json")
+
+
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(firebase_credentials)
+
+db = firestore.client()
+
+
+# ============================================================
+# FLASK HEALTH SERVER
+# ============================================================
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return "Telegram Subscription Bot is running."
+
+
+@app.route("/health")
+def health():
+    return "OK"
+
+
+def run_web_server():
+    app.run(host="0.0.0.0", port=PORT)
+
+
+def start_web_server():
+    thread = Thread(target=run_web_server)
+    thread.daemon = True
+    thread.start()
+
+
+# ============================================================
+# SUBSCRIPTION PLANS
+# ============================================================
+
+PLANS = {
+    "premium": {
+        "name": "Premium",
+        "price": 99,
+        "days": 30,
+        "features": [
+            "Watch",
+            "Request",
+        ],
+    },
+    "premium_plus": {
+        "name": "Premium Plus",
+        "price": 225,
+        "days": 30,
+        "features": [
+            "Download",
+            "Watch",
+            "Request",
+            "Other Language",
+        ],
+    },
+    "premium_star": {
+        "name": "Premium Star",
+        "price": 499,
+        "days": 30,
+        "features": [
+            "Download",
+            "Watch",
+            "Request",
+            "4K",
+            "Other Language",
+        ],
+    },
+}
+
+
+# ============================================================
+# FIREBASE HELPERS
+# ============================================================
+
+def user_ref(user_id):
+    return db.collection("users").document(str(user_id))
+
+
+def payment_ref(payment_id):
+    return db.collection("payments").document(payment_id)
+
+
+def save_user(user):
+    ref = user_ref(user.id)
+
+    data = {
+        "user_id": user.id,
+        "username": user.username or "",
+        "first_name": user.first_name or "",
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    }
+
+    if not ref.get().exists:
+        data["created_at"] = firestore.SERVER_TIMESTAMP
+        data["subscription"] = "none"
+        data["subscription_expiry"] = None
+
+    ref.set(data, merge=True)
+
+
+def get_user(user_id):
+    doc = user_ref(user_id).get()
+
+    if doc.exists:
+        return doc.to_dict()
+
+    return None
+
+
+def get_active_subscription(user_id):
+    data = get_user(user_id)
+
+    if not data:
+        return None
+
+    plan = data.get("subscription")
+
+    expiry = data.get("subscription_expiry")
+
+    if not plan or plan == "none" or not expiry:
+        return None
+
     try:
-        raw_plans = message.text.split(',')
-        plans_dict = {}
-        for p in raw_plans:
-            t, pr = p.strip().split(':')
-            plans_dict[t] = pr
-        
-        channels_col.update_one({"channel_id": ch_id}, {"$set": {"name": ch_name, "plans": plans_dict, "admin_id": ADMIN_ID}}, upsert=True)
-        bot_username = bot.get_me().username
-        bot.send_message(ADMIN_ID, f"✅ Setup Successful!\n\nInvite Link for users:\n`https://t.me/{bot_username}?start={ch_id}`", parse_mode="Markdown")
-    except:
-        bot.send_message(ADMIN_ID, "❌ Invalid format. Please use `Min:Price, Min:Price`. Use /add to retry.")
+        expiry_datetime = expiry
 
-# --- USER: PAYMENT FLOW ---
+        if hasattr(expiry_datetime, "replace"):
+            expiry_datetime = expiry_datetime.replace(tzinfo=timezone.utc)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('select_'))
-def user_pays(call):
-    _, ch_id, mins = call.data.split('_')
-    ch_data = channels_col.find_one({"channel_id": int(ch_id)})
-    price = ch_data['plans'][mins]
-    
-    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=upi://pay?pa={UPI_ID}%26am={price}%26cu=INR"
-    
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid_{ch_id}_{mins}"))
-    markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
-    
-    bot.send_photo(call.message.chat.id, qr_url, 
-                   caption=f"Plan: {mins} Minutes\nPrice: ₹{price}\nUPI ID: `{UPI_ID}`\n\nPlease complete the payment and click 'I Have Paid'.", 
-                   reply_markup=markup, parse_mode="Markdown")
+        if expiry_datetime > datetime.now(timezone.utc):
+            return {
+                "plan": plan,
+                "expiry": expiry_datetime,
+            }
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('paid_'))
-def admin_notify(call):
-    _, ch_id, mins = call.data.split('_')
-    user = call.from_user
-    ch_data = channels_col.find_one({"channel_id": int(ch_id)})
-    price = ch_data['plans'][mins]
-    
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("✅ Approve", callback_data=f"app_{user.id}_{ch_id}_{mins}"))
-    markup.add(InlineKeyboardButton("❌ Reject", callback_data=f"rej_{user.id}"))
-    
-    bot.send_message(ADMIN_ID, f"🔔 *Payment Verification Required!*\n\nUser: {user.first_name}\nChannel: {ch_data['name']}\nPlan: {mins} Mins\nPrice: ₹{price}", 
-                     reply_markup=markup, parse_mode="Markdown")
-    
-    u_markup = InlineKeyboardMarkup().add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
-    bot.send_message(call.message.chat.id, "✅ Your payment request has been sent. Please wait for Admin approval.", reply_markup=u_markup)
-
-# --- APPROVAL & EXPIRY ---
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('app_'))
-def approve_now(call):
-    _, u_id, ch_id, mins = call.data.split('_')
-    u_id, ch_id, mins = int(u_id), int(ch_id), int(mins)
-    
-    try:
-        expiry_datetime = datetime.now() + timedelta(minutes=mins)
-        expiry_ts = int(expiry_datetime.timestamp())
-
-        # Link expires when sub ends
-        link = bot.create_chat_invite_link(ch_id, member_limit=1, expire_date=expiry_ts)
-        
-        users_col.update_one({"user_id": u_id, "channel_id": ch_id}, {"$set": {"expiry": expiry_datetime.timestamp()}}, upsert=True)
-        
-        bot.send_message(u_id, f"🥳 *Payment Approved!*\n\nSubscription: {mins} Minutes\n\nJoin Link: {link.invite_link}\n\n⚠️ Note: This link and your access will expire in {mins} minutes.", parse_mode="Markdown")
-        bot.edit_message_text(f"✅ Approved user {u_id} for {mins} mins.", call.message.chat.id, call.message.message_id)
-        
     except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ Error: {e}")
+        logger.error("Subscription check error: %s", e)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('manage_'))
-def manage_ch(call):
-    ch_id = int(call.data.split('_')[1])
-    ch_data = channels_col.find_one({"channel_id": ch_id})
-    bot_username = bot.get_me().username
-    link = f"https://t.me/{bot_username}?start={ch_id}"
-    
-    bot.edit_message_text(f"Settings for: *{ch_data['name']}*\n\nYour Link: `{link}`\n\nTo edit prices, use /add and forward a message from this channel again.", 
-                          call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+    return None
 
-# Automate Kicking
-def kick_expired_users():
-    now = datetime.now().timestamp()
-    expired_users = users_col.find({"expiry": {"$lte": now}})
-    bot_username = bot.get_me().username
 
-    for user in expired_users:
+def activate_subscription(user_id, plan_id):
+    plan = PLANS[plan_id]
+
+    now = datetime.now(timezone.utc)
+
+    current = get_active_subscription(user_id)
+
+    if current:
+        start_date = current["expiry"]
+    else:
+        start_date = now
+
+    expiry = start_date + timedelta(days=plan["days"])
+
+    user_ref(user_id).set(
+        {
+            "subscription": plan_id,
+            "subscription_expiry": expiry,
+            "subscription_updated": firestore.SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+
+    return expiry
+
+
+# ============================================================
+# KEYBOARDS
+# ============================================================
+
+def main_menu():
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "💎 Subscription Plans",
+                callback_data="plans",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📅 My Subscription",
+                callback_data="my_subscription",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💳 Payment",
+                callback_data="payment",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📞 Support",
+                callback_data="support",
+            )
+        ],
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+def plans_menu():
+    keyboard = []
+
+    for plan_id, plan in PLANS.items():
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"{plan['name']} - ৳{plan['price']}",
+                    callback_data=f"plan_{plan_id}",
+                )
+            ]
+        )
+
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ Back",
+                callback_data="home",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+# ============================================================
+# START
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    save_user(user)
+
+    text = (
+        f"👋 Welcome {user.first_name}!\n\n"
+        "🎬 Welcome to our Premium Membership Bot.\n\n"
+        "Choose an option below:"
+    )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=main_menu(),
+    )
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text(
+        "Available commands:\n\n"
+        "/start - Open bot\n"
+        "/plans - Subscription plans\n"
+        "/myplan - Check subscription\n"
+        "/payment - Payment information\n"
+        "/help - Help"
+    )
+
+
+# ============================================================
+# PLANS COMMAND
+# ============================================================
+
+async def plans_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text(
+        "💎 Subscription Plans",
+        reply_markup=plans_menu(),
+    )
+
+
+# ============================================================
+# MY PLAN
+# ============================================================
+
+async def myplan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    save_user(user)
+
+    subscription = get_active_subscription(user.id)
+
+    if not subscription:
+
+        await update.message.reply_text(
+            "❌ You don't have an active subscription.\n\n"
+            "Use /plans to choose a plan."
+        )
+
+        return
+
+    plan_id = subscription["plan"]
+
+    plan = PLANS.get(plan_id)
+
+    expiry = subscription["expiry"]
+
+    await update.message.reply_text(
+        f"💎 Your Subscription\n\n"
+        f"Plan: {plan['name']}\n"
+        f"Price: ৳{plan['price']}\n"
+        f"Expires: {expiry.strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+
+
+# ============================================================
+# PAYMENT COMMAND
+# ============================================================
+
+async def payment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text(
+        "💳 Payment Methods\n\n"
+        f"bKash: `{BKASH_NUMBER}`\n"
+        f"Nagad: `{NAGAD_NUMBER}`\n\n"
+        "After payment, press the Payment button and submit:\n\n"
+        "1. Your selected plan\n"
+        "2. Transaction ID\n\n"
+        "Your payment will be manually verified by admin.",
+        parse_mode="Markdown",
+        reply_markup=main_menu(),
+    )
+
+
+# ============================================================
+# CALLBACK HANDLER
+# ============================================================
+
+async def callback_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    user = query.from_user
+
+    save_user(user)
+
+    data = query.data
+
+    # --------------------------------------------------------
+    # HOME
+    # --------------------------------------------------------
+
+    if data == "home":
+
+        await query.edit_message_text(
+            "🏠 Main Menu",
+            reply_markup=main_menu(),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # PLANS
+    # --------------------------------------------------------
+
+    if data == "plans":
+
+        await query.edit_message_text(
+            "💎 Choose your subscription plan:",
+            reply_markup=plans_menu(),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # SELECT PLAN
+    # --------------------------------------------------------
+
+    if data.startswith("plan_"):
+
+        plan_id = data.replace("plan_", "")
+
+        if plan_id not in PLANS:
+            return
+
+        plan = PLANS[plan_id]
+
+        features = "\n".join(
+            f"✅ {feature}"
+            for feature in plan["features"]
+        )
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "💳 Buy This Plan",
+                    callback_data=f"buy_{plan_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Back",
+                    callback_data="plans",
+                )
+            ],
+        ]
+
+        await query.edit_message_text(
+            f"💎 {plan['name']}\n\n"
+            f"💰 Price: ৳{plan['price']}\n"
+            f"📅 Duration: {plan['days']} days\n\n"
+            f"Features:\n{features}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # BUY PLAN
+    # --------------------------------------------------------
+
+    if data.startswith("buy_"):
+
+        plan_id = data.replace("buy_", "")
+
+        if plan_id not in PLANS:
+            return
+
+        plan = PLANS[plan_id]
+
+        context.user_data["selected_plan"] = plan_id
+
+        await query.edit_message_text(
+            f"💳 Payment for {plan['name']}\n\n"
+            f"Amount: ৳{plan['price']}\n\n"
+            f"bKash: `{BKASH_NUMBER}`\n"
+            f"Nagad: `{NAGAD_NUMBER}`\n\n"
+            "After sending the money, send your "
+            "transaction ID in the format:\n\n"
+            "`TXID YOUR_TRANSACTION_ID`\n\n"
+            "Example:\n"
+            "`TXID 9A8B7C6D`",
+            parse_mode="Markdown",
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # PAYMENT BUTTON
+    # --------------------------------------------------------
+
+    if data == "payment":
+
+        await query.edit_message_text(
+            "💳 Payment\n\n"
+            f"bKash: `{BKASH_NUMBER}`\n"
+            f"Nagad: `{NAGAD_NUMBER}`\n\n"
+            "Choose a plan first, then send:\n\n"
+            "`TXID YOUR_TRANSACTION_ID`",
+            parse_mode="Markdown",
+            reply_markup=plans_menu(),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # MY SUBSCRIPTION
+    # --------------------------------------------------------
+
+    if data == "my_subscription":
+
+        subscription = get_active_subscription(user.id)
+
+        if not subscription:
+
+            await query.edit_message_text(
+                "❌ No active subscription.\n\n"
+                "Choose a plan to subscribe.",
+                reply_markup=plans_menu(),
+            )
+
+            return
+
+        plan = PLANS[subscription["plan"]]
+
+        expiry = subscription["expiry"]
+
+        await query.edit_message_text(
+            f"💎 Active Subscription\n\n"
+            f"Plan: {plan['name']}\n"
+            f"Price: ৳{plan['price']}\n"
+            f"Expires: {expiry.strftime('%Y-%m-%d %H:%M UTC')}",
+            reply_markup=main_menu(),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # SUPPORT
+    # --------------------------------------------------------
+
+    if data == "support":
+
+        await query.edit_message_text(
+            "📞 Support\n\n"
+            "If you have a payment or subscription problem, "
+            "contact the administrator.",
+            reply_markup=main_menu(),
+        )
+
+        return
+
+
+# ============================================================
+# TRANSACTION ID HANDLER
+# ============================================================
+
+async def transaction_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user = update.effective_user
+
+    save_user(user)
+
+    text = update.message.text.strip()
+
+    if not text.upper().startswith("TXID "):
+
+        await update.message.reply_text(
+            "❌ Invalid format.\n\n"
+            "Please send:\n"
+            "`TXID YOUR_TRANSACTION_ID`\n\n"
+            "Example:\n"
+            "`TXID 9A8B7C6D`",
+            parse_mode="Markdown",
+        )
+
+        return
+
+    txid = text[5:].strip()
+
+    if not txid:
+
+        await update.message.reply_text(
+            "❌ Transaction ID cannot be empty."
+        )
+
+        return
+
+    plan_id = context.user_data.get("selected_plan")
+
+    if not plan_id:
+
+        await update.message.reply_text(
+            "❌ Please select a subscription plan first.",
+            reply_markup=plans_menu(),
+        )
+
+        return
+
+    plan = PLANS[plan_id]
+
+    # Check duplicate transaction
+    existing = (
+        db.collection("payments")
+        .where("transaction_id", "==", txid)
+        .limit(1)
+        .stream()
+    )
+
+    for doc in existing:
+
+        await update.message.reply_text(
+            "❌ This transaction ID has already been submitted."
+        )
+
+        return
+
+    payment_data = {
+        "user_id": user.id,
+        "username": user.username or "",
+        "first_name": user.first_name or "",
+        "plan_id": plan_id,
+        "plan_name": plan["name"],
+        "amount": plan["price"],
+        "transaction_id": txid,
+        "status": "pending",
+        "created_at": firestore.SERVER_TIMESTAMP,
+    }
+
+    payment_document = db.collection("payments").document()
+
+    payment_document.set(payment_data)
+
+    payment_id = payment_document.id
+
+    await update.message.reply_text(
+        "✅ Payment submitted!\n\n"
+        f"Plan: {plan['name']}\n"
+        f"Amount: ৳{plan['price']}\n"
+        f"Transaction ID: {txid}\n\n"
+        "⏳ Waiting for admin approval."
+    )
+
+    # Notify admin
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "✅ APPROVE",
+                callback_data=f"approve_{payment_id}",
+            ),
+            InlineKeyboardButton(
+                "❌ REJECT",
+                callback_data=f"reject_{payment_id}",
+            ),
+        ]
+    ]
+
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=(
+            "🔔 NEW PAYMENT\n\n"
+            f"👤 User: {user.first_name}\n"
+            f"🆔 User ID: {user.id}\n"
+            f"👤 Username: @{user.username or 'None'}\n\n"
+            f"💎 Plan: {plan['name']}\n"
+            f"💰 Amount: ৳{plan['price']}\n"
+            f"🧾 TXID: {txid}\n\n"
+            "Choose an action:"
+        ),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# ============================================================
+# ADMIN APPROVAL / REJECTION
+# ============================================================
+
+async def admin_payment_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    if query.from_user.id != ADMIN_ID:
+
+        await query.answer(
+            "❌ You are not authorized.",
+            show_alert=True,
+        )
+
+        return
+
+    data = query.data
+
+    if data.startswith("approve_"):
+
+        payment_id = data.replace("approve_", "")
+
+        doc_ref = payment_ref(payment_id)
+
+        doc = doc_ref.get()
+
+        if not doc.exists:
+
+            await query.edit_message_text(
+                "❌ Payment not found."
+            )
+
+            return
+
+        payment = doc.to_dict()
+
+        if payment.get("status") != "pending":
+
+            await query.edit_message_text(
+                "⚠️ This payment has already been processed."
+            )
+
+            return
+
+        plan_id = payment["plan_id"]
+
+        expiry = activate_subscription(
+            payment["user_id"],
+            plan_id,
+        )
+
+        doc_ref.update(
+            {
+                "status": "approved",
+                "approved_at": firestore.SERVER_TIMESTAMP,
+                "approved_by": ADMIN_ID,
+            }
+        )
+
+        await query.edit_message_text(
+            "✅ PAYMENT APPROVED\n\n"
+            f"User ID: {payment['user_id']}\n"
+            f"Plan: {payment['plan_name']}\n"
+            f"Amount: ৳{payment['amount']}\n"
+            f"TXID: {payment['transaction_id']}\n"
+            f"Expires: {expiry.strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+
         try:
-            bot.ban_chat_member(user['channel_id'], user['user_id'])
-            bot.unban_chat_member(user['channel_id'], user['user_id'])
-            
-            rejoin_url = f"https://t.me/{bot_username}?start={user['channel_id']}"
-            markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🔄 Re-join / Renew", url=rejoin_url))
-            
-            bot.send_message(user['user_id'], "⚠️ Your subscription has expired.\n\nTo join again or renew, please click the button below:", reply_markup=markup)
-            users_col.delete_one({"_id": user['_id']})
-        except: pass
 
-# --- STARTUP ---
-if __name__ == '__main__':
-    keep_alive()
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(kick_expired_users, 'interval', minutes=1)
-    scheduler.start()
-    bot.remove_webhook()
-    print("Bot is running...")
-    bot.infinity_polling(timeout=20, long_polling_timeout=10)
+            await context.bot.send_message(
+                chat_id=payment["user_id"],
+                text=(
+                    "🎉 Payment Approved!\n\n"
+                    f"💎 Plan: {payment['plan_name']}\n"
+                    f"💰 Amount: ৳{payment['amount']}\n\n"
+                    "✅ Your subscription is now active.\n\n"
+                    f"📅 Expires: "
+                    f"{expiry.strftime('%Y-%m-%d %H:%M UTC')}"
+                ),
+            )
+
+        except Exception as e:
+
+            logger.error(
+                "Could not notify user: %s",
+                e,
+            )
+
+        return
+
+    if data.startswith("reject_"):
+
+        payment_id = data.replace("reject_", "")
+
+        doc_ref = payment_ref(payment_id)
+
+        doc = doc_ref.get()
+
+        if not doc.exists:
+
+            await query.edit_message_text(
+                "❌ Payment not found."
+            )
+
+            return
+
+        payment = doc.to_dict()
+
+        if payment.get("status") != "pending":
+
+            await query.edit_message_text(
+                "⚠️ This payment has already been processed."
+            )
+
+            return
+
+        doc_ref.update(
+            {
+                "status": "rejected",
+                "rejected_at": firestore.SERVER_TIMESTAMP,
+                "rejected_by": ADMIN_ID,
+            }
+        )
+
+        await query.edit_message_text(
+            "❌ PAYMENT REJECTED\n\n"
+            f"User ID: {payment['user_id']}\n"
+            f"Plan: {payment['plan_name']}\n"
+            f"TXID: {payment['transaction_id']}"
+        )
+
+        try:
+
+            await context.bot.send_message(
+                chat_id=payment["user_id"],
+                text=(
+                    "❌ Payment Rejected.\n\n"
+                    "Your transaction could not be verified.\n"
+                    "Please contact admin/support."
+                ),
+            )
+
+        except Exception as e:
+
+            logger.error(
+                "Could not notify user: %s",
+                e,
+            )
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    logger.error(
+        "Exception while handling update:",
+        exc_info=context.error,
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    start_web_server()
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CommandHandler("help", help_command)
+    )
+
+    application.add_handler(
+        CommandHandler("plans", plans_command)
+    )
+
+    application.add_handler(
+        CommandHandler("myplan", myplan_command)
+    )
+
+    application.add_handler(
+        CommandHandler("payment", payment_command)
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            admin_payment_handler,
+            pattern=r"^(approve_|reject_)",
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            callback_handler
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            transaction_handler,
+        )
+    )
+
+    application.add_error_handler(error_handler)
+
+    logger.info("Bot started.")
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
+
+if __name__ == "__main__":
+    main()
