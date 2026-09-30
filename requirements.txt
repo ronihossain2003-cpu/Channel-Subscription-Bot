@@ -1,4 +1,5 @@
-pyTelegramBotAPI
-pymongo[srv]
-apscheduler
-flask
+python-telegram-bot==22.6
+firebase-admin==7.1.0
+python-dotenv==1.1.1
+Flask==3.1.2
+gunicorn==23.0.0
